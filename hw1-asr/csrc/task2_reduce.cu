@@ -70,11 +70,20 @@ __global__ void softmax_kernel(const float* x, float* y, int cols) {
   // reading x only once, with MaxSum.
   // YOUR CODE HERE
   // ============================================================
+  MaxSum acc = {-INFINITY, 0.0f};
+  for (int c = threadIdx.x; c < cols; c += blockDim.x)
+    acc = maxsum_merge(acc, MaxSum{xr[c], 1.0f});
 
+  row_max = block_reduce_max(acc.m);                 
+  row_sum = block_reduce_sum(acc.l * expf(acc.m - row_max));  
   // ======================== BLANK 2.7 =========================
   // Pass 2: y = exp(x - row_max) / row_sum.
   // YOUR CODE HERE
   // ============================================================
+  for (int c = threadIdx.x; c < cols; c += blockDim.x)  {
+    yr[c]= expf(xr[c] - row_max) / row_sum;
+  }
+
 }
 
 ASR_API int launch_rmsnorm(const float* x, const float* weight, float* y, int rows,
