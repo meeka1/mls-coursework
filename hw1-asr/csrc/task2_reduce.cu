@@ -44,6 +44,16 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
   // RMSNorm of this row: y = x / sqrt(mean(x^2) + eps) * weight.
   // YOUR CODE HERE
   // ============================================================
+  float sum = 0.0f;  
+  for (int c = threadIdx.x; c < cols; c+= blockDim.x) {
+    sum += xr[c] * xr[c];
+  }
+  const float rstd = rsqrtf(block_reduce_sum(sum) / cols + eps); 
+
+  for (int c = threadIdx.x; c < cols; c+= blockDim.x) {
+    yr[c] = xr[c] * rstd * weight[c];
+  }
+  
 }
 
 // Softmax over each row: y = exp(x - max) / sum(exp(x - max)).
