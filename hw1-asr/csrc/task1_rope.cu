@@ -68,8 +68,10 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // Rotate the pair (v[i], v[i + half]) in place.
   // YOUR CODE HERE
   // ============================================================
-  v[i] = v[i] * cosf(pos * inv_freq[i]) - v[i + half] * sinf(pos * inv_freq[i]); 
-  v[i + half] = v[i + half] * cosf(pos * inv_freq[i]) + v[i] * sinf(pos * inv_freq[i]);
+  float a = v[i], b = v[i + half];
+  float angle = pos * inv_freq[i];
+  v[i] = a * cosf(pos * inv_freq[i]) - b * sinf(pos * inv_freq[i]); 
+  v[i + half] = b * cosf(pos * inv_freq[i]) + a * sinf(pos * inv_freq[i]);
 }
 
 ASR_API int launch_rope(float* q, float* k, const float* inv_freq, int batch, int seq_len,
