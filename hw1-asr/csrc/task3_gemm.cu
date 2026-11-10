@@ -34,18 +34,26 @@ __global__ void linear_tiled_kernel(const float* x, const float* w, const float*
     // Load this thread's element of the x tile into xs. Use 0 outside x.
     // YOUR CODE HERE
     // ============================================================
-
+    int a_col= k0 + tx; 
+    xs[ty][tx] = (row < M && a_col < K) ? x[row*K + a_col] : 0.0f; 
     // ======================== BLANK 3.2 =========================
     // Load this thread's element of the w tile, so that ws[n][k] holds
     // w[blockIdx.x * TILE + n][k0 + k]. Use 0 outside w. Threads with consecutive
     // tx must read consecutive addresses of w.
     // YOUR CODE HERE
     // ============================================================
-
+    int w_row = blockIdx.x * TILE + ty;
+    int w_col = k0 + tx;
+    ws[ty][tx] = (w_row < N && w_col < K) ? w[w_row * K + w_col] : 0.0f;
+    __syncthreads();
     // ======================== BLANK 3.3 =========================
     // Add this K step's contribution to acc.
     // YOUR CODE HERE
     // ============================================================
+    for (int k = 0; k < TILE; ++k) {
+      acc += xs[ty][k] * ws[tx][k];
+    }
+    __syncthreads();
   }
 
   // ======================== BLANK 3.4 =========================
@@ -53,6 +61,16 @@ __global__ void linear_tiled_kernel(const float* x, const float* w, const float*
   // gelu() when act == ACT_GELU, and store.
   // YOUR CODE HERE
   // ============================================================
+  if (row < M && col < N) {
+    float result = acc;
+    if (bias != nullptr) {
+      result += bias[col];
+    }
+    if (act == ACT_GELU) {
+      result = gelu(result);
+    }
+    y[row * N + col] = result;
+  }
 }
 
 ASR_API int launch_linear(const float* x, const float* w, const float* bias, float* y,
