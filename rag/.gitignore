@@ -6,7 +6,7 @@ __pycache__/
 .cache/
 .venv/
 venv/
-results/
+results/migration_answers_smoke/
 *.log
 .pytest_cache/
 *.aux
