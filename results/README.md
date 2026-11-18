@@ -44,6 +44,28 @@ in rotating order, one model load, warm-up excluded. Medians per clip:
   by launching many small operations, not by arithmetic. The extra concatenations cost it
   about 44 ms.
 
+Per-operation profile on `test_audio.wav` (3.5 s, `./run.sh --profile`), before and after
+both speed-ups (`asr/profile_{cuda,torch}.txt` and `asr/profile_{cuda,torch}_final.txt`):
+
+| Kernels | | Time per transcription | linear | attention | rope | rmsnorm |
+|---|---|---|---|---|---|---|
+| ours | before | 3314 ms | 2879 ms (83%) | 565 ms (16%) | 3 ms | 6 ms |
+| ours | after | **707 ms** | 693 ms (94%) | 23 ms (3%) | 5 ms | 15 ms |
+| PyTorch | before | 820 ms | 578 ms (51%) | 250 ms (22%) | 255 ms (22%) | 46 ms (4%) |
+| PyTorch | after | 672 ms | 284 ms (29%) | 175 ms (18%) | 398 ms (41%) | 101 ms (10%) |
+
+- On our kernels attention time falls 25×: the encoder no longer attends over 1500 padded
+  positions, and each decoder step has one query instead of the whole sequence. `linear`
+  falls 4.2× and is now 94% of the time. The remaining cost is one-row matrix–vector
+  products over the full weights, so a dedicated GEMV kernel or float16 weights would be
+  the next step.
+- Before the speed-ups our kernels were 4.0× slower than PyTorch; after, 1.05×. Most of the
+  gap came from work the model did not need to do, not from the kernels themselves.
+- On PyTorch the per-operation times are dominated by launch overhead (the totals add up
+  to more than the wall time because each operation is synchronised for timing). `rope`
+  grows because cached decoding builds a two-position buffer for every layer and step.
+  This is the extra cost that cancels the KV cache's gain on that backend.
+
 Raw rows: `asr/bench_torch.jsonl`, `asr/bench_cuda.jsonl`. Re-print the table with
 `python hw1-asr/bench_asr.py --summary results/asr/bench_torch.jsonl results/asr/bench_cuda.jsonl`.
 
