@@ -79,6 +79,9 @@ class GlmAsr:
             self.audio_head_dim, c.audio_rotary_factor, c.audio_rope_base, device)
         self.text_inv_freq, self.text_rotary_dim = inv_freq(
             self.text_head_dim, 1.0, c.text_rope_base, device)
+        # Speed-ups, switchable for benchmarking (bench_asr.py).
+        self.trim_padding = True   # encode only the real audio frames, not the 30 s padding
+        self.use_kv_cache = True   # decoder keeps K/V of earlier positions instead of recomputing them
 
     # ---------------- audio encoder ----------------
 
@@ -107,8 +110,25 @@ class GlmAsr:
         x = ops.linear(x, w[p + "mlp.fc1.weight"], w[p + "mlp.fc1.bias"], act="gelu")
         return h + ops.linear(x, w[p + "mlp.fc2.weight"], w[p + "mlp.fc2.bias"])
 
+    def get_valid_audio_length(self, features_mask, batch_idx):
+        """Return the number of valid audio feature frames."""
+        return int(features_mask[batch_idx].sum().item())
+
+    def remove_audio_padding(self, features, features_mask, batch_idx):
+        """Remove padded frames from audio features."""
+        valid_len = self.get_valid_audio_length(features_mask, batch_idx)
+
+        if valid_len <= 0:
+            raise ValueError("Audio contains no valid frames.")
+
+        return features[
+            batch_idx:batch_idx + 1, :, :valid_len
+        ].contiguous()
+
     def encode_audio(self, features, features_mask):
         """features: [B, 128 mel bins, T] -> audio embeddings [num_audio_tokens, text_hidden]."""
+        if self.trim_padding:  # batch size 1, as everywhere in this model
+            features = self.remove_audio_padding(features, features_mask, 0)
         x = features.transpose(1, 2).contiguous()               # [B, T, 128]
         x = self.conv1d_gelu(x, "audio_tower.conv1", stride=1)  # [B, T, 1280]
         x = self.conv1d_gelu(x, "audio_tower.conv2", stride=2)  # [B, T/2, 1280]
@@ -135,14 +155,36 @@ class GlmAsr:
 
     # ---------------- text decoder ----------------
 
-    def decoder_layer(self, h, i):
+    def rope_at(self, q, k, offset):
+        """RoPE for positions offset, offset+1, ... The rope_ kernel numbers positions from 0
+        and keeps its signature, so for a single new token at position p we rotate a
+        two-position buffer with inv_freq scaled by p: its second row gets angle 1 * p * f,
+        exactly the angle position p would get."""
+        if offset == 0:
+            ops.rope_(q, k, self.text_inv_freq, self.text_rotary_dim)
+            return q, k
+        assert q.shape[1] == 1, "cached decoding adds one position at a time"
+        qb = torch.cat([torch.zeros_like(q), q], dim=1)
+        kb = torch.cat([torch.zeros_like(k), k], dim=1)
+        ops.rope_(qb, kb, self.text_inv_freq * offset, self.text_rotary_dim)
+        return qb[:, 1:], kb[:, 1:]
+
+    def decoder_layer(self, h, i, cache=None, offset=0):
+        """cache: per-layer list of (k, v) for positions before `offset`, extended in place."""
         c, w, p = self.c, self.w, f"language_model.model.layers.{i}."
         B, S, _ = h.shape
         x = ops.rmsnorm(h, w[p + "input_layernorm.weight"], c.rms_eps)
         q = ops.linear(x, w[p + "self_attn.q_proj.weight"]).view(B, S, c.text_heads, self.text_head_dim)
         k = ops.linear(x, w[p + "self_attn.k_proj.weight"]).view(B, S, c.text_kv_heads, self.text_head_dim)
         v = ops.linear(x, w[p + "self_attn.v_proj.weight"]).view(B, S, c.text_kv_heads, self.text_head_dim)
-        ops.rope_(q, k, self.text_inv_freq, self.text_rotary_dim)
+        q, k = self.rope_at(q, k, offset)
+        if cache is not None:
+            if offset:
+                k = torch.cat([cache[i][0], k], dim=1)
+                v = torch.cat([cache[i][1], v], dim=1)
+            cache[i] = (k, v)
+        # With a cache, q covers the new positions only and k, v all positions so far;
+        # the attention kernel aligns them at the end (query j sits at position j + Sk - Sq).
         a = ops.attention(q, k, v, causal=True).view(B, S, c.text_hidden)
         h = h + ops.linear(a, w[p + "self_attn.o_proj.weight"])
 
@@ -151,11 +193,11 @@ class GlmAsr:
         up = ops.linear(x, w[p + "mlp.up_proj.weight"])
         return h + ops.linear(ops.silu_mul(gate, up), w[p + "mlp.down_proj.weight"])
 
-    def next_token_probs(self, embeds):
+    def next_token_probs(self, embeds, cache=None, offset=0):
         """embeds: [B, S, hidden] -> probabilities of the next token [B, vocab]."""
         h = embeds
         for i in range(self.c.text_layers):
-            h = self.decoder_layer(h, i)
+            h = self.decoder_layer(h, i, cache, offset)
         last = ops.rmsnorm(h[:, -1], self.w["language_model.model.norm.weight"], self.c.rms_eps)
         logits = ops.linear(last, self.w["language_model.lm_head.weight"])  # only the last position
         return ops.softmax(logits)
@@ -173,16 +215,26 @@ class GlmAsr:
         embeds = torch.cat([embeds[:, :first], audio[None], embeds[:, last + 1:]], dim=1)
 
         tokens, probs = [], []
+        cache = [None] * self.c.text_layers if self.use_kv_cache else None
+        step_input, offset = embeds, 0
         for _ in range(max_new_tokens):
-            # No KV cache: the whole sequence is recomputed for every new token.
-            p = self.next_token_probs(embeds)
+            if cache is None:
+                # No KV cache: the whole sequence is recomputed for every new token.
+                p = self.next_token_probs(embeds)
+            else:
+                # Prompt once, then only the newest token; earlier K/V come from the cache.
+                p = self.next_token_probs(step_input, cache, offset)
+                offset += step_input.shape[1]
             best = torch.argmax(p, dim=-1)                          # greedy choice
             tokens.append(int(best[0]))
             probs.append(float(p[0, best[0]]))
             if tokens[-1] in self.c.eos_token_ids:
                 break
             new = ops.embedding(best[:, None], self.w["language_model.model.embed_tokens.weight"])
-            embeds = torch.cat([embeds, new], dim=1)
+            if cache is None:
+                embeds = torch.cat([embeds, new], dim=1)
+            else:
+                step_input = new
         return tokens, probs
 
 
