@@ -17,6 +17,7 @@ top-k search.
 
 | Strategy | How a partly migrated index is searched |
 |---|---|
+| no-map | One list: enc_a query scored directly against raw enc_b vectors for legacy records |
 | naive | One list: enc_a scores for migrated records, mapped-query (A→B) scores for legacy records |
 | z-calibrated | As naive, but each part's scores are standardised per query |
 | dual-read | Search both parts separately, merge rankings with reciprocal rank fusion |
@@ -45,15 +46,21 @@ Retrieval runs make no ELM calls. Answer generation and judging do.
 
 ### Retrieval: Recall@10 by fraction migrated (mean over 5 seeds)
 
-| Migrated | naive | z-calibrated | dual-read | map-docs |
-|---|---|---|---|---|
-| 0% | 0.453 | 0.453 | 0.453 | 0.465 |
-| 10% | 0.205 | 0.390 | 0.423 | 0.464 |
-| 25% | 0.262 | 0.346 | 0.451 | 0.460 |
-| 50% | 0.339 | 0.368 | 0.456 | 0.460 |
-| 75% | 0.418 | 0.427 | 0.430 | 0.466 |
-| 90% | 0.459 | 0.463 | 0.407 | 0.476 |
-| 100% (baseline) | 0.475 | 0.475 | 0.475 | 0.475 |
+| Migrated | no-map | naive | z-calibrated | dual-read | map-docs |
+|---|---|---|---|---|---|
+| 0% | 0.423 | 0.453 | 0.453 | 0.453 | 0.465 |
+| 10% | 0.079 | 0.205 | 0.390 | 0.423 | 0.464 |
+| 25% | 0.179 | 0.262 | 0.346 | 0.451 | 0.460 |
+| 50% | 0.289 | 0.339 | 0.368 | 0.456 | 0.460 |
+| 75% | 0.395 | 0.418 | 0.427 | 0.430 | 0.466 |
+| 90% | 0.449 | 0.459 | 0.463 | 0.407 | 0.476 |
+| 100% (baseline) | 0.475 | 0.475 | 0.475 | 0.475 | 0.475 |
+
+no-map is the worst option at every partial fraction (Recall@10 0.079 and NDCG@10 0.080
+at 10% migrated), even though raw enc_b works reasonably on its own at 0%. So the drop
+comes from mixing two score scales in one list, and most of what the map buys is putting
+legacy records on the enc_a scale. Practice shows the same pattern; NDCG@10 for all
+strategies is in `rag/results/migration_{dev,practice}.json`.
 
 map-docs stays at 97–100% of the baseline on Recall@10, Recall@100, MRR@10 and
 NDCG@10 at every fraction.
@@ -117,11 +124,13 @@ Run on 2026-11-16 with the dev transcripts from `migration_answers_dev/target.js
 
 ## Still to do
 
-- [ ] Add **no-map** (raw enc_b vectors, enc_a query) as a strategy in the sweep
+- [x] Add **no-map** (raw enc_b vectors, enc_a query) as a strategy in the sweep
       table, so the map's own contribution is visible at every fraction.
 - [ ] Answer quality at more than one fraction (e.g. 50% and 0%), not only 10%.
-- [ ] Judge noise: repeated judging on a subset, or a paired bootstrap CI from
-      the per-query scores.
+- [x] Paired bootstrap CIs on the judge scores (`judge_robust.py compare`):
+      map-docs vs naive +0.060 [+0.006, +0.115], map-docs vs target +0.006
+      [−0.044, +0.057], naive vs target −0.054 [−0.110, +0.003].
+- [ ] Judge noise: judge a subset more than once.
 - [ ] Report hardware, timing boundaries, transcript source (ASR kernels or
       PyTorch) and caching.
 
@@ -237,7 +246,7 @@ Note: loading the cross-encoder in float16 on CPU is extremely slow; the script
 forces float32. The Hugging Face download failed in this environment with an httpx
 decompression error, so the model files were fetched with curl and passed as a path.
 
-## 5. Selective corrective retrieval ([corrective.py](corrective.py)) — in progress
+## 5. Selective corrective retrieval ([corrective.py](corrective.py))
 
 For queries below a margin threshold, one ELM call corrects the query, then enc_a
 searches again:
@@ -261,14 +270,47 @@ python rag/extensions/corrective.py --split dev --mode rewrite --output rag/resu
 python rag/extensions/corrective.py --split dev --mode hyde --output rag/results/corrective_hyde_dev.json
 ```
 
-The pipeline has been tested end to end with a stand-in for the ELM output; no ELM
-results yet.
+### Results (EuroLLM-22B, temperature 0)
+
+One practical issue first: EuroLLM often ignores "reply with the question only" and adds
+a `**Rewritten Question:**` label and a list of "Key Adjustments" (3 of the first 5
+rewrites). That text would end up in the query embedding, so `clean()` strips it before
+encoding. The raw outputs are still in the cache.
+
+We picked the setting on practice (best NDCG@10: hyde + mix, applied to every query) and
+then checked it on dev. Deltas are against the baseline, with 95% paired-bootstrap CIs:
+
+| Split | Setting | NDCG@10 | Δ NDCG@10 | Relevant in top 5 |
+|---|---|---|---|---|
+| practice | baseline | 0.420 | | 59.1% |
+| practice | hyde + mix | 0.438 | +0.018 [+0.002, +0.035] | 60.3% |
+| practice | rewrite + mix | 0.436 | +0.015 [+0.000, +0.031] | 59.7% |
+| dev | baseline | 0.398 | | 58.4% |
+| dev | hyde + mix | 0.420 | +0.022 [+0.000, +0.046] | 59.2% |
+| dev | rewrite + mix | 0.412 | +0.014 [−0.004, +0.033] | 63.2% |
+
+Each corrected query costs one ELM call: about 2.4 s for hyde and 1 s for rewrite (median),
+plus a few ms to re-encode.
+
+What we take from it:
+
+- The gain is small and borderline: roughly +5% NDCG@10, with CIs touching zero, and the
+  share of queries with a relevant record in the top 5 hardly changes.
+- Searching with the corrected text alone (`replace`) is worse than the baseline (dev
+  NDCG@10 about 0.36). The original transcript has to stay in the query (`mix` or `fuse`).
+- The margin does not pick the right queries. Results keep improving as more queries are
+  corrected, and correcting the lowest-margin 25% or 50% does no better than correcting a
+  random 25% or 50%. Low-margin queries are mostly vague or misheard, and a rewrite does
+  not fix that.
+- Answer quality has not been checked for this yet.
+
+Per-setting numbers: `rag/results/corrective_{rewrite,hyde}_{practice,dev}.json`.
 
 ## Still to do
 
-- [ ] Run `corrective.py` (rewrite and hyde) on dev.
-- [ ] Choose the margin threshold on **practice** and report on dev. This needs
-      `rag/.cache/practice_transcripts.jsonl` (ASR on a GPU node, or a teammate's copy).
+- [x] Run `corrective.py` (rewrite and hyde) on practice and dev.
+- [x] Choose the setting on practice and report on dev (hyde + mix on all queries;
+      margin gating was no better than random selection).
 - [ ] Generate and judge answers for the best corrective setting, against the
       baseline answers already in `migration_answers_dev/target.jsonl`.
 - [ ] Optional: a stronger reranker (e.g. `BAAI/bge-reranker-base`) on GPU, to test

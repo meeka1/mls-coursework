@@ -9,7 +9,7 @@ The corrected text is encoded with enc_a and searched again. Ways to use the sec
   fuse     reciprocal rank fusion of the original and corrected rankings
   mix      search with normalise(original vector + corrected vector)
 
-ELM outputs are cached per query, so threshold sweeps and variants cost nothing extra.
+Raw ELM outputs are cached per query and cleaned of labels/notes by `clean` before encoding, so threshold sweeps and variants cost nothing extra.
 
     # smoke test: 5 queries, inspect the rewrites
     python rag/extensions/corrective.py --split dev --mode rewrite --limit 5 --show
@@ -28,6 +28,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+import re
 import time
 
 import numpy as np
@@ -51,6 +52,23 @@ PROMPTS = {
     ),
 }
 RRF_K = 60
+LABEL = re.compile(r"^\s*\*{0,2}\s*(rewritten question|question|answer|response)\s*:?\s*\*{0,2}\s*:?\s*", re.I)
+HEADER = re.compile(r"^\s*(\*\*[^*]+\*\*\s*:?|#+ .*|(key )?(adjustments|changes|notes?|explanation)\s*:)\s*$", re.I)
+
+
+def clean(text):
+    """The model often wraps its output as '**Rewritten Question:** ... **Key Adjustments:** ...'.
+    Keep only the content: drop a leading label, stop at the first later section header."""
+    lines, out = text.strip().splitlines(), []
+    for line in lines:
+        if not out:
+            line = LABEL.sub("", line)
+            if not line.strip() or HEADER.match(line):
+                continue
+        elif HEADER.match(line):
+            break
+        out.append(line)
+    return " ".join(l.strip() for l in out if l.strip()).strip().strip('"').strip() or text.strip()
 
 
 class Rewriter:
@@ -140,7 +158,7 @@ def main():
     enc = SentenceTransformer(str(ROOT / "models" / "enc_a"), device=args.device,
                               model_kwargs={"dtype": torch.float32})
     t0 = time.perf_counter()
-    Qc = enc.encode([corr[q]["text"] for q in qids], normalize_embeddings=True, convert_to_numpy=True,
+    Qc = enc.encode([clean(corr[q]["text"]) for q in qids], normalize_embeddings=True, convert_to_numpy=True,
                     show_progress_bar=False).astype(np.float32)
     encode_ms = (time.perf_counter() - t0) * 1000.0 / len(qids)
 
@@ -165,7 +183,7 @@ def main():
             print(f"\n[{q}] margin {margin[j]:.3f}  gold@5 {base[j]['gold@5']:.0f} -> replace {per['replace'][j]['gold@5']:.0f}"
                   f" / fuse {per['fuse'][j]['gold@5']:.0f}")
             print(f"  asr : {tr[q]}")
-            print(f"  {args.mode:4s}: {corr[q]['text']}")
+            print(f"  {args.mode:4s}: {clean(corr[q]['text'])}")
 
     print(f"\nsplit={args.split} queries={len(qids)} mode={args.mode}")
     print(f"ELM call: median {np.median(elm_ms):.0f} ms, p95 {np.percentile(elm_ms, 95):.0f} ms; "

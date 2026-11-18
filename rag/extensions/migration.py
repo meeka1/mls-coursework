@@ -7,6 +7,7 @@ rest only an enc_b vector. enc_b has no query encoder, so queries reach the
 legacy part through a linear map fitted on records that exist in both spaces.
 
 Strategies for scoring a partly migrated corpus:
+  no-map        one index, raw enc_b vectors for legacy records scored with the enc_a query (no map)
   naive         one index, enc_a scores for migrated records, mapped-query enc_b scores for the rest
   z-calibrated  as naive, but each part's scores are standardised per query
   dual-read     search both parts separately and merge the two rankings (reciprocal rank fusion)
@@ -33,7 +34,7 @@ from src.metrics import mrr_at_k, ndcg_at_k, recall_at_k
 
 DATA_DIR = ROOT / "data" / "rag_corpus"
 CACHE_DIR = ROOT / ".cache"
-STRATEGIES = ["naive", "z-calibrated", "dual-read", "map-docs"]
+STRATEGIES = ["no-map", "naive","z-calibrated", "dual-read", "map-docs"]
 METRICS = ["Recall@10", "Recall@100", "MRR@10", "NDCG@10"]
 RRF_K = 60
 RRF_DEPTH = 1000
@@ -106,6 +107,8 @@ def rrf(parts, n_records):
 def score(strategy, s, moved, maps):
     """Score matrix [records, queries] for one strategy on a partly migrated corpus."""
     Q = s.Q.T
+    if strategy == "no-map":
+        return np.where(moved[:, None], s.A @ Q, s.B @ Q)
     if strategy == "map-docs":
         legacy = normalise(s.B @ maps["b2a"]) @ Q
         return np.where(moved[:, None], s.A @ Q, legacy)
@@ -143,8 +146,9 @@ def fit_maps(s, pair_idx):
 def serving_cost(s, strategy, moved, maps, repeats=200):
     """Per-query search latency and index memory for one strategy, one query at a time."""
     q = s.Q[0]
-    if strategy == "map-docs":
-        index = np.where(moved[:, None], s.A, normalise(s.B @ maps["b2a"]))
+    if strategy in ("map-docs", "no-map"):
+        legacy = normalise(s.B @ maps["b2a"]) if strategy == "map-docs" else s.B
+        index = np.where(moved[:, None], s.A, legacy)
         t0 = time.perf_counter()
         for _ in range(repeats):
             sc = index @ q
