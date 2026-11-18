@@ -107,8 +107,25 @@ class GlmAsr:
         x = ops.linear(x, w[p + "mlp.fc1.weight"], w[p + "mlp.fc1.bias"], act="gelu")
         return h + ops.linear(x, w[p + "mlp.fc2.weight"], w[p + "mlp.fc2.bias"])
 
+    def get_valid_audio_length(self, features_mask, batch_idx):
+        """Return the number of valid audio feature frames."""
+        return int(features_mask[batch_idx].sum().item())
+
+
+    def remove_audio_padding(self, features, features_mask, batch_idx):
+        """Remove padded frames from audio features."""
+        valid_len = self.get_valid_audio_length(features_mask, batch_idx)
+
+        if valid_len <= 0:
+            raise ValueError("Audio contains no valid frames.")
+
+        return features[
+            batch_idx:batch_idx + 1, :, :valid_len
+        ].contiguous()
+
     def encode_audio(self, features, features_mask):
         """features: [B, 128 mel bins, T] -> audio embeddings [num_audio_tokens, text_hidden]."""
+        features = self.remove_audio_padding(features, features_mask, 0) # NEW: remove padding
         x = features.transpose(1, 2).contiguous()               # [B, T, 128]
         x = self.conv1d_gelu(x, "audio_tower.conv1", stride=1)  # [B, T, 1280]
         x = self.conv1d_gelu(x, "audio_tower.conv2", stride=2)  # [B, T/2, 1280]
