@@ -32,3 +32,5 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+submission/*.zip
+report/overleaf_upload.zip
