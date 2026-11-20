@@ -68,7 +68,8 @@ records score higher \emph{as numbers}, not because they are more relevant. Mapp
 \enca\ space with one least-squares fit (\emph{map-docs}) keeps 97--100\% of baseline quality at every fraction,
 at no extra search cost, and its answers beat the naive strategy by +0.060 judge score (95\% CI
 $[+0.006, +0.115]$). (2) Trimming the padding and adding a KV cache make transcription 4.5$\times$ faster on our
-kernels with identical transcripts after trimming, while the same KV cache gives nothing on PyTorch: whether an
+kernels; the KV cache changes no transcript and trimming changes 11 of 101, almost all in formatting. The
+same KV cache gives nothing on PyTorch: whether an
 optimisation pays depends on what the implementation is bound by. (3) Retrieval is the baseline's bottleneck,
 but neither later stage pays for itself: reranking lowers NDCG@10 and costs 5\,s per query, and LLM query
 correction gains +0.022 NDCG@10 (interval touching zero) for 2.5\,s per query.
@@ -87,8 +88,9 @@ encoder. Equal dimensions do not make the spaces compatible.
 \textbf{CUDA kernels (our work).} RoPE \citep{su2021roformer} rotates one $(q,k)$ pair per thread, queries and
 keys in one launch. Reductions use warp shuffles and one shared-memory slot per warp; softmax keeps a running
 (max, sum) pair \citep{milakov2018online}, so it reads each element twice instead of three times. The GEMM
-stages $16\times16$ tiles of $x$ and $W$ in shared memory, pads the $W$ tile against bank conflicts and fuses
-bias and GELU into the store. Attention follows FlashAttention \citep{dao2022flashattention}: each warp owns
+stages $16\times16$ tiles of $x$ and $W$ in shared memory (256 threads per block, one output each; every loaded
+value is reused 16 times), pads each row of the $W$ tile by one float, so the 16 threads that read one column
+hit 16 shared-memory banks instead of 2, and fuses bias and GELU into the store. Attention follows FlashAttention \citep{dao2022flashattention}: each warp owns
 one query, keys and values stream through shared memory 32 at a time, and the score matrix is never stored.
 Causal masking aligns the last query with the last key, so the same kernel serves the cached decoder below.
 
@@ -262,6 +264,14 @@ shared-memory loads per multiply-add; cuBLAS keeps a small block of outputs per 
 each loaded value several times \citep{volkov2008benchmarking}. Peak memory is 0.32\,GiB below PyTorch's,
 partly because our attention never stores the score matrix (180\,MB per encoder layer if it did).
 
+\textbf{Guide questions} (one per task; more in Appendix~\ref{app:questions}). \emph{RoPE Q1:} the encoder case
+reads 1.92M floats and writes as many (15.4\,MB); at 0.030\,ms this is the 505\,GB/s above, 82\% of peak, so
+the kernel is memory-bound. \emph{Reductions Q3:} our softmax reads each element of $x$ twice (one pass keeps a
+running max and sum, one normalises and writes); the textbook version reads it three times. \emph{GEMM Q2:}
+register tiling, as above: cuBLAS reuses each value it loads from shared memory for several outputs, ours for
+one. \emph{Attention Q1:} the full score matrix of one encoder layer would take
+$20 \times 1{,}500^2 \times 4$\,B $= 180$\,MB; one block of our kernel uses 17.1\,KB of shared memory.
+
 \subsection{ASR: removing wasted work}
 
 \begin{table}[t]
@@ -389,7 +399,7 @@ textbook version reads three times (max, then sum, then write).
 \textbf{GEMM Q2 (why cuBLAS is faster).} Register tiling: a cuBLAS thread computes a small block of outputs and
 keeps them in registers, so each value it loads from shared memory feeds several multiply-adds. Our thread
 computes one output and needs two shared-memory loads per multiply-add, so shared-memory bandwidth, not
-arithmetic, bounds the inner loop (1.4--1.8 vs 12.6--12.9\,TFLOP/s on encoder shapes).
+arithmetic, bounds the inner loop (1.4--1.8 vs 12.6--13.0\,TFLOP/s on encoder shapes).
 
 \textbf{Attention Q1 (memory).} The full score matrix of one encoder layer would take
 $20 \times 1{,}500 \times 1{,}500 \times 4$\,B $= 180$\,MB. One block of our kernel uses
@@ -517,7 +527,17 @@ text decoder (GQA 16/4, causal)      PASS  max_err=5.21e-07     0.069 ms      24
 audio encoder (20 heads, 1500)       PASS  max_err=2.68e-07    12.433 ms      927 GFLOP/s
 
 Task 4 (attention): ALL PASS
+\end{verbatim}
+}
 
+\textbf{Reading the profile below.} It runs the supplied model, without trim or KV cache, on our four kernels.
+The GEMM of task 3 (\texttt{linear}) takes 83\% of the GPU time and attention 16\%; all memory-bound kernels
+together take under 1\%. This is why Section~4.3 concentrates on the GEMM, and why removing rows from the
+GEMM (Section~4.4) pays off so much on our kernels. The same profile after trim and KV cache, and the PyTorch
+profiles before and after, are in \texttt{results/asr/} of the code submission.
+
+{\scriptsize
+\begin{verbatim}
 $ ./run.sh --profile
 GPU: NVIDIA GeForce RTX 2080 Ti (sm_75)
 Kernels: rope=cuda  reduce=cuda  gemm=cuda  attention=cuda  provided=cuda
